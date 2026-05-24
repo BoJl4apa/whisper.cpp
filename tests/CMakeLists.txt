@@ -78,6 +78,24 @@ add_test(NAME ${TEST_TARGET}
     -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
 set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "large")
 
+set(TEST_TARGET test-whisper-cli-detect-language-candidates)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:whisper-cli>
+    -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-base.bin
+    -ng -dl --language-candidates en,fr
+    -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
+set_tests_properties(${TEST_TARGET} PROPERTIES LABELS "base;gh")
+
+set(TEST_TARGET test-whisper-cli-detect-language-candidates-nonmultilingual)
+add_test(NAME ${TEST_TARGET}
+    COMMAND $<TARGET_FILE:whisper-cli>
+    -m ${PROJECT_SOURCE_DIR}/models/for-tests-ggml-base.en.bin
+    -ng -dl --language-candidates en,fr
+    -f ${PROJECT_SOURCE_DIR}/samples/jfk.wav)
+set_tests_properties(${TEST_TARGET} PROPERTIES
+    LABELS "base;en"
+    WILL_FAIL TRUE)
+
 if (WHISPER_COMMON_FFMPEG)
     set(TEST_TARGET test-whisper-cli-tiny-mp3)
     # Check with reviewers: any way to check the output transcription via ctest (diff, ...)?
@@ -178,3 +196,13 @@ add_parakeet_transcription_test(
     tests/parakeet-expected-diffusion-output.txt
     0.95)
 
+set(LANG_TEST test-lang-auto-detect)
+add_executable(${LANG_TEST} ${LANG_TEST}.cpp)
+target_include_directories(${LANG_TEST} PRIVATE ../include ../ggml/include ../examples)
+target_link_libraries(${LANG_TEST} PRIVATE common)
+target_compile_definitions(${LANG_TEST} PRIVATE
+    WHISPER_MODEL_PATH="${PROJECT_SOURCE_DIR}/models/for-tests-ggml-base.bin"
+    WHISPER_MODEL_EN_PATH="${PROJECT_SOURCE_DIR}/models/for-tests-ggml-base.en.bin"
+    SAMPLE_PATH="${PROJECT_SOURCE_DIR}/samples/jfk.wav")
+add_test(NAME ${LANG_TEST} COMMAND ${LANG_TEST})
+set_tests_properties(${LANG_TEST} PROPERTIES LABELS "base;en;unit")
