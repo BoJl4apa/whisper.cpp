@@ -4042,7 +4042,7 @@ const char * whisper_lang_str_full(int id) {
     return nullptr;
 }
 
-static int whisper_lang_candidates_to_ids(
+int whisper_lang_candidates_to_ids(
         const char * func_name,
         const char * const * language_candidates,
         int n_language_candidates,
@@ -4093,14 +4093,14 @@ static int whisper_lang_candidates_to_ids(
 }
 
 static int whisper_lang_auto_detect_impl(
-        const char * func_name,
+                    const char * func_name,
         struct whisper_context * ctx,
-        struct whisper_state * state,
-        int offset_ms,
-        int n_threads,
-        const char * const * language_candidates,
-        int n_language_candidates,
-        float * lang_probs) {
+          struct whisper_state * state,
+                           int   offset_ms,
+                           int   n_threads,
+            const char * const * language_candidates,
+                           int   n_language_candidates,
+                         float * lang_probs) {
     if (n_language_candidates > 0 && !whisper_is_multilingual(ctx)) {
         WHISPER_LOG_ERROR("%s: constrained auto-detect requires a multilingual model\n", func_name);
         return -5;
@@ -4129,6 +4129,7 @@ static int whisper_lang_auto_detect_impl(
         return -2;
     }
 
+    // run the encoder
     if (whisper_encode_with_state(ctx, state, seek, n_threads) != 0) {
         WHISPER_LOG_ERROR("%s: failed to encode\n", func_name);
         return -6;
@@ -4150,30 +4151,58 @@ static int whisper_lang_auto_detect_impl(
         logits_id.emplace_back(state->logits[token_lang], lang_id);
     }
 
-    using pair_type = std::remove_reference<decltype(logits_id)>::type::value_type;
-    std::sort(logits_id.begin(), logits_id.end(), [](const pair_type & a, const pair_type & b) {
-        return a.first > b.first;
-    });
-
-    const auto max = logits_id[0].first;
-
-    double sum = 0.0f;
-    for (auto & kv : logits_id) {
-        kv.first = exp(kv.first - max);
-        sum += kv.first;
+    // sort descending
+    {
+        using pair_type = std::remove_reference<decltype(logits_id)>::type::value_type;
+        std::sort(logits_id.begin(), logits_id.end(), [](const pair_type & a, const pair_type & b) {
+            return a.first > b.first;
+        });
     }
 
-    for (auto & kv : logits_id) {
-        kv.first /= sum;
+    // softmax
+    {
+        const auto max = logits_id[0].first;
+
+        double sum = 0.0f;
+        for (auto & kv : logits_id) {
+            kv.first = exp(kv.first - max);
+            sum += kv.first;
+        }
+
+        for (auto & kv : logits_id) {
+            kv.first /= sum;
+        }
     }
 
-    for (const auto & prob : logits_id) {
-        if (lang_probs) {
-            lang_probs[prob.second] = prob.first;
+    {
+        for (const auto & prob : logits_id) {
+            if (lang_probs) {
+                lang_probs[prob.second] = prob.first;
+            }
+
+            //printf("%s: lang %2d (%3s): %f\n", func_name, prob.second, whisper_lang_str(prob.second), prob.first);
         }
     }
 
     return logits_id[0].second;
+}
+
+int whisper_lang_auto_detect(
+        struct whisper_context * ctx,
+                           int   offset_ms,
+                           int   n_threads,
+                         float * lang_probs) {
+    return whisper_lang_auto_detect_with_state(ctx, ctx->state, offset_ms, n_threads, lang_probs);
+}
+
+int whisper_lang_auto_detect_candidates(
+        struct whisper_context * ctx,
+                           int   offset_ms,
+                           int   n_threads,
+                 const char * const * language_candidates,
+                           int   n_language_candidates,
+                         float * lang_probs) {
+    return whisper_lang_auto_detect_with_state_candidates(ctx, ctx->state, offset_ms, n_threads, language_candidates, n_language_candidates, lang_probs);
 }
 
 int whisper_lang_auto_detect_with_state(
@@ -4194,24 +4223,6 @@ int whisper_lang_auto_detect_with_state_candidates(
                            int   n_language_candidates,
                          float * lang_probs) {
     return whisper_lang_auto_detect_impl(__func__, ctx, state, offset_ms, n_threads, language_candidates, n_language_candidates, lang_probs);
-}
-
-int whisper_lang_auto_detect(
-        struct whisper_context * ctx,
-                           int   offset_ms,
-                           int   n_threads,
-                         float * lang_probs) {
-    return whisper_lang_auto_detect_with_state(ctx, ctx->state, offset_ms, n_threads, lang_probs);
-}
-
-int whisper_lang_auto_detect_candidates(
-        struct whisper_context * ctx,
-                           int   offset_ms,
-                           int   n_threads,
-                 const char * const * language_candidates,
-                           int   n_language_candidates,
-                         float * lang_probs) {
-    return whisper_lang_auto_detect_with_state_candidates(ctx, ctx->state, offset_ms, n_threads, language_candidates, n_language_candidates, lang_probs);
 }
 
 int whisper_model_n_vocab(struct whisper_context * ctx) {
@@ -6942,9 +6953,8 @@ int whisper_full_with_state(
 
         const auto lang_id = params.n_language_candidates > 0
             ? whisper_lang_auto_detect_with_state_candidates(
-                    ctx, state, 0, params.n_threads,
-                    params.language_candidates, params.n_language_candidates,
-                    probs.data())
+                ctx, state, 0, params.n_threads,
+                params.language_candidates, params.n_language_candidates, probs.data())
             : whisper_lang_auto_detect_with_state(ctx, state, 0, params.n_threads, probs.data());
         if (lang_id < 0) {
             WHISPER_LOG_ERROR("%s: failed to auto-detect language\n", __func__);
