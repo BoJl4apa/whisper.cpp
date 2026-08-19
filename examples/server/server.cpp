@@ -5,6 +5,8 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -111,6 +113,7 @@ struct whisper_params {
     bool carry_initial_prompt      = false;
 
     std::string language               = "en";
+    std::vector<std::string> language_candidates = {};
     std::string prompt                 = "";
     std::string font_path              = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf";
     std::string model                  = "models/ggml-base.en.bin";
@@ -129,6 +132,71 @@ struct whisper_params {
     int         vad_speech_pad_ms           = 30;
     float       vad_samples_overlap         = 0.1f;
 };
+
+// Mirrors the helpers in examples/cli/cli.cpp. Worth hoisting into common.h
+// if a third caller appears.
+static std::vector<std::string> string_split(const std::string & input, char separator) {
+    std::vector<std::string> result;
+    size_t start = 0;
+
+    while (start <= input.size()) {
+        const size_t next = input.find(separator, start);
+        const std::string token = input.substr(start, next == std::string::npos ? std::string::npos : next - start);
+        result.push_back(token);
+
+        if (next == std::string::npos) {
+            break;
+        }
+
+        start = next + 1;
+    }
+
+    return result;
+}
+
+static std::string string_join(const std::vector<std::string> & values, const std::string & separator) {
+    std::string joined;
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            joined += separator;
+        }
+        joined += values[i];
+    }
+
+    return joined;
+}
+
+// Parses a candidate list exactly as whisper-cli does: lowercased, then split
+// on ','. Lowercasing matters because whisper_lang_id() is a case-sensitive
+// lookup, so "EN,FR" is valid on the CLI and must be valid here too.
+//
+// A wholly empty value yields an empty list. That is how a client opts out of a
+// server-side default set with --language-candidates; anything else keeps the
+// CLI's behaviour, so a malformed entry such as "en,,ru" still fails validation.
+static std::vector<std::string> parse_language_candidates(const std::string & value) {
+    if (value.find_first_not_of(" \t") == std::string::npos) {
+        return {};
+    }
+
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return (char) std::tolower(c); });
+
+    return string_split(lowered, ',');
+}
+
+// Rejects empty entries and unknown codes; reports the offender via `bad`.
+static bool validate_language_candidates(const std::vector<std::string> & candidates, std::string & bad) {
+    for (const auto & candidate : candidates) {
+        if (candidate.empty() || whisper_lang_id(candidate.c_str()) == -1) {
+            bad = candidate;
+            return false;
+        }
+    }
+
+    return true;
+}
 
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params, const server_params& sparams) {
     fprintf(stderr, "\n");
@@ -162,6 +230,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -nt,       --no-timestamps             [%-7s] do not print timestamps\n",                        params.no_timestamps ? "true" : "false");
     fprintf(stderr, "  -l LANG,   --language LANG             [%-7s] spoken language ('auto' for auto-detect)\n",       params.language.c_str());
     fprintf(stderr, "  -dl,       --detect-language           [%-7s] exit after automatically detecting language\n",    params.detect_language ? "true" : "false");
+    fprintf(stderr, "             --language-candidates      [%-7s] comma-separated codes constraining auto-detect\n", string_join(params.language_candidates, ",").c_str());
     fprintf(stderr, "             --prompt PROMPT             [%-7s] initial prompt\n",                                 params.prompt.c_str());
     fprintf(stderr, "             --carry-initial-prompt      [%-7s] always prepend initial prompt\n",                  params.carry_initial_prompt ? "true" : "false");
     fprintf(stderr, "  -m FNAME,  --model FNAME               [%-7s] model path\n",                                     params.model.c_str());
@@ -234,6 +303,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (arg == "-nt"    || arg == "--no-timestamps")             { params.no_timestamps             = true; }
         else if (arg == "-l"     || arg == "--language")                  { params.language                  = argv[++i]; }
         else if (arg == "-dl"    || arg == "--detect-language")           { params.detect_language           = true; }
+        else if (                   arg == "--language-candidates")       { params.language_candidates       = parse_language_candidates(argv[++i]); }
         else if (                   arg == "--prompt")                    { params.prompt                    = argv[++i]; }
         else if (                   arg == "--carry-initial-prompt")      { params.carry_initial_prompt      = true; }
         else if (arg == "-m"     || arg == "--model")                     { params.model                     = argv[++i]; }
@@ -565,6 +635,10 @@ void get_req_parameters(const Request & req, whisper_params & params)
     {
         params.detect_language = parse_str_to_bool(req.get_file_value("detect_language").content);
     }
+    if (req.has_file("language_candidates"))
+    {
+        params.language_candidates = parse_language_candidates(req.get_file_value("language_candidates").content);
+    }
     if (req.has_file("prompt"))
     {
         params.prompt = req.get_file_value("prompt").content;
@@ -646,6 +720,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
         whisper_print_usage(argc, argv, params, sparams);
         exit(0);
+    }
+
+    {
+        std::string bad_candidate;
+        if (!validate_language_candidates(params.language_candidates, bad_candidate)) {
+            fprintf(stderr, "error: unknown language candidate '%s'\n", bad_candidate.c_str());
+            whisper_print_usage(argc, argv, params, sparams);
+            exit(0);
+        }
     }
 
     if (params.diarize && params.tinydiarize) {
@@ -832,6 +915,17 @@ int main(int argc, char ** argv) {
         whisper_params params = default_params;
         get_req_parameters(req, params);
 
+        {
+            std::string bad_candidate;
+            if (!validate_language_candidates(params.language_candidates, bad_candidate)) {
+                fprintf(stderr, "error: unknown language candidate '%s'\n", bad_candidate.c_str());
+                const std::string error_resp = "{\"error\":\"unknown language candidate\"}";
+                res.status = 400;
+                res.set_content(error_resp, "application/json");
+                return;
+            }
+        }
+
         std::string filename{audio_file.filename};
         printf("Received request: %s\n", filename.c_str());
 
@@ -895,6 +989,10 @@ int main(int argc, char ** argv) {
                     params.translate = false;
                     fprintf(stderr, "%s: WARNING: model is not multilingual, ignoring language and translation options\n", __func__);
                 }
+                if (!params.language_candidates.empty()) {
+                    params.language_candidates.clear();
+                    fprintf(stderr, "%s: WARNING: model is not multilingual, ignoring language candidates\n", __func__);
+                }
             }
             if (params.detect_language) {
                 params.language = "auto";
@@ -924,6 +1022,17 @@ int main(int argc, char ** argv) {
             wparams.translate        = params.translate;
             wparams.language         = params.language.c_str();
             wparams.detect_language  = params.detect_language;
+
+            // The pointer array and the strings it points at must both outlive
+            // the whisper_full call below. `params` is request-scoped and
+            // already backs wparams.language the same way.
+            std::vector<const char *> language_candidates;
+            language_candidates.reserve(params.language_candidates.size());
+            for (const auto & candidate : params.language_candidates) {
+                language_candidates.push_back(candidate.c_str());
+            }
+            wparams.language_candidates   = language_candidates.empty() ? nullptr : language_candidates.data();
+            wparams.n_language_candidates = (int) language_candidates.size();
             wparams.n_threads        = params.n_threads;
             wparams.n_max_text_ctx   = params.max_context >= 0 ? params.max_context : wparams.n_max_text_ctx;
             wparams.offset_ms        = params.offset_t_ms;
@@ -1066,7 +1175,16 @@ int main(int argc, char ** argv) {
             // Only compute language probabilities if requested (expensive operation)
             if (!params.no_language_probabilities) {
                 std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
-                const auto detected_lang_id = whisper_lang_auto_detect(ctx, 0, params.n_threads, lang_probs.data());
+                // The probe stays unconstrained so language_probabilities keeps the
+                // full distribution, which is what makes a bad detection
+                // diagnosable. But when candidates constrained the real detection,
+                // report the language actually used for the transcript rather than
+                // the unconstrained winner, so this field cannot contradict
+                // "language" above.
+                const auto probe_lang_id = whisper_lang_auto_detect(ctx, 0, params.n_threads, lang_probs.data());
+                const auto detected_lang_id = params.language_candidates.empty()
+                    ? probe_lang_id
+                    : whisper_full_lang_id(ctx);
                 jres["detected_language"] = whisper_lang_str_full(detected_lang_id);
                 jres["detected_language_probability"] = lang_probs[detected_lang_id];
                 jres["language_probabilities"] = json::object();
